@@ -36,7 +36,7 @@ if WHEEL_CMD in sys.argv:
 
         def get_tag(self):
             _, _, plat = bdist_wheel.get_tag(self)
-            python = "cp36.cp37.cp38.py36.py37.py38"
+            python = "cp36.cp37.cp38.cp39.py36.py37.py38.py39"
             abi = "none"
             plat = "macosx_10_14_x86_64" if "macosx" in plat else "any"
             return python, abi, plat
@@ -100,10 +100,8 @@ setuptools.setup(
     install_requires=[
         "attrs>=19.3.0",
         "colorama>=0.4.3",
-        "junit_xml==1.9",
         "requests>=2.22.0",
-        # Pin exact version of 'ruamel.yaml' because of unstable API.
-        "ruamel.yaml==0.16.10",
+        "ruamel.yaml>=0.16.0,<0.18",
         "tqdm>=4.46.1",
         "packaging>=20.4",
         "jsonschema~=3.2.0",
@@ -127,6 +125,7 @@ setuptools.setup(
         "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
         "Topic :: Security",
         "Topic :: Software Development :: Quality Assurance",
     ],

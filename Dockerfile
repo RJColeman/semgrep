@@ -5,8 +5,10 @@
 # Then 'semgrep-core' alone is copied to a container with that takes care
 # of the 'semgrep' wrapping.
 #
+# The same applies to the 'spacegrep' executable.
+#
 
-FROM returntocorp/ocaml:alpine-2020-10-28 as build-semgrep-core
+FROM returntocorp/ocaml:alpine-2021-04-08 as build-semgrep-core
 
 USER root
 # for ocaml-pcre now used in semgrep-core
@@ -18,7 +20,6 @@ WORKDIR /home/user
 COPY --chown=user .gitmodules /semgrep/.gitmodules
 COPY --chown=user .git/ /semgrep/.git/
 COPY --chown=user semgrep-core/ /semgrep/semgrep-core/
-COPY --chown=user spacegrep/ /semgrep/spacegrep/
 COPY --chown=user scripts /semgrep/scripts
 
 WORKDIR /semgrep
@@ -30,15 +31,13 @@ RUN git submodule foreach --recursive git clean -dfX
 
 RUN git submodule update --init --recursive --depth 1
 
-RUN eval "$(opam env)" && ./scripts/install-ocaml-tree-sitter
-RUN eval "$(opam env)" && opam install --deps-only -y spacegrep/
-RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/pfff/
+RUN eval "$(opam env)" && ./scripts/install-tree-sitter-runtime
+RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/src/pfff/
 RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/
-RUN eval "$(opam env)" && DUNE_PROFILE=static make -C spacegrep/
 RUN eval "$(opam env)" && make -C semgrep-core/ all
 
 # Sanity checks
-RUN test -x ./spacegrep/_build/install/default/bin/spacegrep
+RUN test -x ./semgrep-core/_build/install/default/bin/spacegrep
 RUN ./semgrep-core/_build/install/default/bin/semgrep-core -version
 
 #
@@ -57,7 +56,7 @@ COPY --from=build-semgrep-core \
 RUN semgrep-core -version
 
 COPY --from=build-semgrep-core \
-     /semgrep/spacegrep/_build/install/default/bin/spacegrep \
+     /semgrep/semgrep-core/_build/install/default/bin/spacegrep \
      /usr/local/bin/spacegrep
 RUN ln -sf spacegrep /usr/local/bin/spacecat
 
@@ -69,6 +68,9 @@ RUN mkdir -p /src
 RUN chmod 777 /src
 RUN mkdir -p /tmp/.cache
 RUN chmod 777 /tmp/.cache
+
+# Let the user know how their container was built
+COPY dockerfiles/semgrep.Dockerfile /Dockerfile
 
 RUN adduser -D -u 1000 semgrep
 USER 1000

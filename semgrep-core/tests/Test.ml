@@ -2,7 +2,9 @@
 open Common
 open OUnit
 module E = Error_code
+module P = Pattern_match
 module R = Mini_rule
+module T = Tainting_rule
 
 (*****************************************************************************)
 (* Purpose *)
@@ -114,27 +116,77 @@ let regression_tests_for_lang ~with_caching files lang =
        (Filename.concat data_path "basic_equivalences.yml")
      else []
     in
-    Semgrep_generic.check
-      ~hook:(fun _env matched_tokens ->
-      (* there are a few fake tokens in the generic ASTs now (e.g., 
-       * for DotAccess generated outside the grammar) *)
-        let xs = Lazy.force matched_tokens in
-        let toks = xs |> List.filter Parse_info.is_origintok in
-        let (minii, _maxii) = Parse_info.min_max_ii_by_pos toks in
-        Error_code.error minii (Error_code.SemgrepMatchFound ("",""))
-      )
-      ~with_caching
-      [rule] equiv file lang ast |> ignore;
-
-    let actual = !Error_code.g_errors in
-    let expected = Error_code.expected_error_lines_of_files [file] in
-      Error_code.compare_actual_to_expected actual expected; 
+    Common.save_excursion Flag_semgrep.with_opt_cache with_caching (fun() ->
+     Match_patterns.check
+       ~hook:(fun _env matched_tokens ->
+       (* there are a few fake tokens in the generic ASTs now (e.g., 
+        * for DotAccess generated outside the grammar) *)
+         let xs = Lazy.force matched_tokens in
+         let toks = xs |> List.filter Parse_info.is_origintok in
+         let (minii, _maxii) = Parse_info.min_max_ii_by_pos toks in
+         Error_code.error minii (Error_code.SemgrepMatchFound ("",""))
+       )
+       Config_semgrep.default_config
+       [rule] equiv (file, lang, ast) 
+     |> ignore;
+  
+     let actual = !Error_code.g_errors in
+     let expected = Error_code.expected_error_lines_of_files [file] in
+       Error_code.compare_actual_to_expected actual expected; 
+    )     
    )
  )
 (*e: function [[Test.regression_tests_for_lang]] *)
 
+let tainting_test lang rules_file file =
+  let rules =
+    try
+      Parse_tainting_rules.parse rules_file
+    with exn ->
+      failwith (spf "fail to parse tainting rules %s (exn = %s)"
+                rules_file
+                (Common.exn_to_s exn))
+  in
+  let ast = 
+      try 
+        let { Parse_target. ast; errors; _ } = 
+          Parse_target.parse_and_resolve_name_use_pfff_or_treesitter lang file 
+        in
+        if errors <> []
+        then pr2 (spf "WARNING: fail to fully parse %s" file);
+        ast
+      with exn ->
+        failwith (spf "fail to parse %s (exn = %s)" file 
+                  (Common.exn_to_s exn))
+  in
+  let rules =
+    rules |> List.filter (fun r -> List.mem lang r.T.languages) in
+  let matches = Tainting_generic.check rules file ast in
+  let actual =
+    matches |> List.map (fun m ->
+      { E.typ = SemgrepMatchFound(m.P.rule_id.id,m.P.rule_id.message);
+        loc   = fst m.range_loc;
+        sev   = Error; }
+      )
+  in
+  let expected = Error_code.expected_error_lines_of_files [file] in
+  Error_code.compare_actual_to_expected actual expected
+
+let tainting_tests_for_lang files lang =
+  files |> List.map (fun file ->
+   (Filename.basename file) >:: (fun () ->
+    let rules_file =
+      let (d,b,_e) = Common2.dbe_of_filename file in
+      let candidate1 = Common2.filename_of_dbe (d,b,"yaml") in
+      if Sys.file_exists candidate1
+      then candidate1
+      else failwith (spf "could not find tainting rules file for %s" file)
+    in
+    tainting_test lang rules_file file
+  ))
+
 (*****************************************************************************)
-(* More tests *)
+(* Tests *)
 (*****************************************************************************)
 
 (* This differs from pfff/tests/<lang>/parsing because here we also use
@@ -161,6 +213,12 @@ let lang_parsing_tests =
       let lang = Lang.Rust in
       parsing_tests_for_lang files lang
     );
+    "Kotlin" >::: (
+      let dir = Filename.concat (Filename.concat tests_path "kotlin") "parsing" in
+      let files = Common2.glob (spf "%s/*.kt" dir) in
+      let lang = Lang.Kotlin in
+      parsing_tests_for_lang files lang
+    );
     (* here we have both a Pfff and tree-sitter parser *)
     "Java" >::: (
       let dir= Filename.concat (Filename.concat tests_path "java") "parsing" in
@@ -178,6 +236,18 @@ let lang_parsing_tests =
       let dir = Filename.concat tests_path "ruby/parsing" in
       let files = Common2.glob (spf "%s/*.rb" dir) in
       let lang = Lang.Ruby in
+      parsing_tests_for_lang files lang
+    );
+    "Javascript" >::: (
+      let dir = Filename.concat tests_path "js/parsing" in
+      let files = Common2.glob (spf "%s/*.js" dir) in
+      let lang = Lang.Javascript in
+      parsing_tests_for_lang files lang
+    );
+    "Scala" >::: (
+      let dir = Filename.concat tests_path "scala/parsing" in
+      let files = Common2.glob (spf "%s/*.scala" dir) in
+      let lang = Lang.Scala in
       parsing_tests_for_lang files lang
     );
   ]
@@ -277,8 +347,49 @@ let lang_regression_tests ~with_caching =
     let lang = Lang.Rust in
     regression_tests_for_lang files lang
   );
+  "semgrep Yaml" >::: (
+    let dir = Filename.concat tests_path "yaml" in
+    let files = Common2.glob (spf "%s/*.yaml" dir) in
+    let lang = Lang.Yaml in
+    regression_tests_for_lang files lang
+  );
+  "semgrep Scala" >::: (
+    let dir = Filename.concat tests_path "scala" in
+    let files = Common2.glob (spf "%s/*.scala" dir) in
+    let lang = Lang.Scala in
+    regression_tests_for_lang files lang
+  );
  ]
 (*e: constant [[Test.lang_regression_tests]] *)
+
+let full_rule_regression_tests =
+  "full rule" >:: (fun () ->
+      let path = Filename.concat tests_path "OTHER/rules" in
+      Test_engine.test_rules ~ounit_context:true [path]
+  )
+
+let lang_tainting_tests =
+  let taint_tests_path = Filename.concat tests_path "tainting_rules" in
+  "lang tainting rules testing" >::: [
+    "tainting PHP" >::: (
+      let dir = Filename.concat taint_tests_path "php" in
+      let files = Common2.glob (spf "%s/*.php" dir) in
+      let lang = Lang.PHP in
+      tainting_tests_for_lang files lang
+    );
+    "tainting Python" >::: (
+      let dir = Filename.concat taint_tests_path "python" in
+      let files = Common2.glob (spf "%s/*.py" dir) in
+      let lang = Lang.Python in
+      tainting_tests_for_lang files lang
+    );
+    "tainting Typescript" >::: (
+      let dir = Filename.concat taint_tests_path "ts" in
+      let files = Common2.glob (spf "%s/*.ts" dir) in
+      let lang = Lang.Typescript in
+      tainting_tests_for_lang files lang
+    );
+  ]
 
 (*s: constant [[Test.lint_regression_tests]] *)
 (* mostly a copy paste of pfff/linter/unit_linter.ml *)
@@ -295,7 +406,7 @@ let lint_regression_tests ~with_caching =
   let lang = Lang.Python in
 
   let test_files = [
-   p "OTHER/rules/stupid.py";
+   p "OTHER/mini_rules/stupid.py";
   ] in
 
   (* expected *)
@@ -310,9 +421,13 @@ let lint_regression_tests ~with_caching =
     E.try_with_exn_to_error file (fun () ->
     let { Parse_target. ast; _} = 
         Parse_target.just_parse_with_lang lang file in
-    Semgrep_generic.check ~hook:(fun _ _ -> ()) ~with_caching
-      rules equivs file lang ast
+    Common.save_excursion Flag_semgrep.with_opt_cache with_caching (fun() ->
+      Match_patterns.check ~hook:(fun _ _ -> ())
+         Config_semgrep.default_config
+         rules equivs 
+         (file, lang, ast)
       |> List.iter JSON_report.match_to_error;
+    )
   ));
 
   (* compare *)
@@ -365,6 +480,8 @@ let test regexp =
       lint_regression_tests ~with_caching:false;
       lint_regression_tests ~with_caching:true;
       eval_regression_tests;
+      full_rule_regression_tests;
+      lang_tainting_tests;
     ]
   in
   let suite =

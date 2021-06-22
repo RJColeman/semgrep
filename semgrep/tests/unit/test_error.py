@@ -6,16 +6,15 @@ from typing import List
 import pytest
 from ruamel.yaml import YAML
 
+from semgrep.constants import OutputFormat
 from semgrep.core_runner import CoreRunner
-from semgrep.error import InvalidPatternError
 from semgrep.error import SemgrepError
 from semgrep.error import SourceParseError
-from semgrep.evaluation import BooleanRuleExpression
-from semgrep.evaluation import OPERATORS
+from semgrep.output import OutputSettings
 from semgrep.pattern import Pattern
 from semgrep.rule import Rule
 
-yaml = YAML(typ="rt")
+yaml = YAML()
 
 
 def test_different_hash():
@@ -82,10 +81,12 @@ def test_raise_semgrep_error_from_json_unknown_error():
 
     core_runner = CoreRunner(
         allow_exec=False,
+        output_settings=OutputSettings(OutputFormat.TEXT),
         jobs=1,
         timeout=0,
         max_memory=0,
         timeout_threshold=0,
+        optimizations="all",
     )
 
     patterns: List[Pattern] = list(core_runner._flatten_rule_patterns([rule]))

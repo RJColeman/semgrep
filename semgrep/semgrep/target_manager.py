@@ -8,16 +8,14 @@ from typing import Collection
 from typing import Dict
 from typing import Iterator
 from typing import List
-from typing import NewType
 from typing import Set
 
 import attr
 
+from semgrep.config_resolver import resolve_targets
 from semgrep.error import FilesNotFoundError
 from semgrep.output import OutputHandler
-from semgrep.semgrep_types import GENERIC_LANGUAGE
 from semgrep.semgrep_types import Language
-from semgrep.semgrep_types import REGEX_ONLY_LANGUAGE_KEYS
 from semgrep.target_manager_extensions import ALL_EXTENSIONS
 from semgrep.target_manager_extensions import FileExtension
 from semgrep.target_manager_extensions import lang_to_exts
@@ -57,12 +55,13 @@ class TargetManager:
 
     includes: List[str]
     excludes: List[str]
+    max_target_bytes: int
     targets: List[str]
     respect_git_ignore: bool
     output_handler: OutputHandler
     skip_unknown_extensions: bool
 
-    _filtered_targets: Dict[str, Set[Path]] = attr.ib(factory=dict)
+    _filtered_targets: Dict[Language, Set[Path]] = attr.ib(factory=dict)
 
     @staticmethod
     def resolve_targets(targets: List[str]) -> Set[Path]:
@@ -70,11 +69,7 @@ class TargetManager:
         Return list of Path objects appropriately resolving relative paths
         (relative to cwd) if necessary
         """
-        base_path = Path(".")
-        return set(
-            Path(target) if Path(target).is_absolute() else base_path.joinpath(target)
-            for target in targets
-        )
+        return set(resolve_targets(targets))
 
     @staticmethod
     def _is_valid(path: Path) -> bool:
@@ -86,7 +81,7 @@ class TargetManager:
     ) -> Set[Path]:
         """
         Recursively go through a directory and return list of all files with
-        default file extention of language
+        default file extension of language
         """
 
         def _parse_output(output: str, curr_dir: Path) -> Set[Path]:
@@ -107,7 +102,7 @@ class TargetManager:
                 }
             return files
 
-        def _find_files_with_extention(
+        def _find_files_with_extension(
             curr_dir: Path, extension: FileExtension
         ) -> Set[Path]:
             """
@@ -155,7 +150,7 @@ class TargetManager:
                     )
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     # Not a git directory or git not installed. Fallback to using rglob
-                    ext_files = _find_files_with_extention(curr_dir, ext)
+                    ext_files = _find_files_with_extension(curr_dir, ext)
                     expanded = expanded.union(ext_files)
                 else:
                     tracked = _parse_output(tracked_output, curr_dir)
@@ -166,7 +161,7 @@ class TargetManager:
                     expanded = expanded.difference(deleted)
 
             else:
-                ext_files = _find_files_with_extention(curr_dir, ext)
+                ext_files = _find_files_with_extension(curr_dir, ext)
                 expanded = expanded.union(ext_files)
 
         return expanded
@@ -210,14 +205,33 @@ class TargetManager:
         if not includes:
             return arr
 
-        return set(elem for elem in arr if TargetManager.match_glob(elem, includes))
+        return {elem for elem in arr if TargetManager.match_glob(elem, includes)}
 
     @staticmethod
     def filter_excludes(arr: Set[Path], excludes: List[str]) -> Set[Path]:
         """
-        Returns all elements in arr that do not match any excludes excludes
+        Returns all elements in arr that do not match any excludes pattern
         """
-        return set(elem for elem in arr if not TargetManager.match_glob(elem, excludes))
+        return {elem for elem in arr if not TargetManager.match_glob(elem, excludes)}
+
+    @staticmethod
+    def filter_by_size(arr: Set[Path], max_target_bytes: int) -> Set[Path]:
+        """
+        Return all the files whose size doesn't exceed the limit.
+
+        If max_target_bytes is zero or negative, all paths are returned.
+        If some paths are invalid, they may or may not be included in the
+        result.
+        """
+        if max_target_bytes <= 0:
+            return arr
+        else:
+            return {
+                path
+                for path in arr
+                if TargetManager._is_valid(path)
+                and os.path.getsize(path) <= max_target_bytes
+            }
 
     def filtered_files(self, lang: Language) -> Set[Path]:
         """
@@ -226,6 +240,8 @@ class TargetManager:
         match any pattern in EXCLUDES. Any file in TARGET bypasses excludes and includes.
         If a file in TARGET has a known extension that is not for langugage LANG then
         it is also filtered out
+
+        Note also filters out any directory and decendants of `.git`
         """
         if lang in self._filtered_targets:
             return self._filtered_targets[lang]
@@ -243,7 +259,8 @@ class TargetManager:
 
         targets = self.expand_targets(directories, lang, self.respect_git_ignore)
         targets = self.filter_includes(targets, self.includes)
-        targets = self.filter_excludes(targets, self.excludes)
+        targets = self.filter_excludes(targets, self.excludes + [".git"])
+        targets = self.filter_by_size(targets, self.max_target_bytes)
 
         # Remove explicit_files with known extensions.
         explicit_files_with_lang_extension = set(
@@ -281,4 +298,5 @@ class TargetManager:
         targets = self.filtered_files(lang)
         targets = self.filter_includes(targets, includes)
         targets = self.filter_excludes(targets, excludes)
+        targets = self.filter_by_size(targets, self.max_target_bytes)
         return list(targets)

@@ -57,6 +57,7 @@ class SemgrepError(Exception):
         return {
             "type": self.__class__.__name__,
             "code": self.code,
+            "level": self.level.name.lower(),
             **self.to_dict_base(),
         }
 
@@ -250,6 +251,27 @@ class ErrorWithSpan(SemgrepError):
 class InvalidPatternError(ErrorWithSpan):
     code = INVALID_PATTERN_EXIT_CODE
     level = Level.ERROR
+
+
+@attr.s(frozen=True, eq=True)
+class InvalidPatternErrorNoSpan(SemgrepError):
+    rule_id: str = attr.ib()
+    pattern: str = attr.ib()
+    language: str = attr.ib()
+
+    code = INVALID_PATTERN_EXIT_CODE
+    level = Level.ERROR
+
+    def __str__(self) -> str:
+        msg = f"Rule id: {self.rule_id} contains a pattern that could not be parsed as a pattern for language {self.language}: `{self.pattern}`"
+        return with_color(Fore.RED, msg)
+
+    def to_dict_base(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "pattern": self.pattern,
+            "language": self.language,
+        }
 
 
 @attr.s(frozen=True, eq=True)

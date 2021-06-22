@@ -1,7 +1,6 @@
 import collections
 import functools
 import json
-import logging
 import re
 import subprocess
 import tempfile
@@ -20,38 +19,43 @@ from typing import Sequence
 from typing import Set
 from typing import Tuple
 
-from semgrep.target_manager_extensions import all_supported_languages
-
-logger = logging.getLogger(__name__)
 from ruamel.yaml import YAML
 
 from semgrep.constants import PLEASE_FILE_ISSUE_TEXT
-from semgrep.constants import SEMGREP_PATH
 from semgrep.core_exception import CoreException
 from semgrep.equivalences import Equivalence
 from semgrep.error import _UnknownLanguageError
 from semgrep.error import InvalidPatternError
+from semgrep.error import InvalidPatternErrorNoSpan
 from semgrep.error import MatchTimeoutError
 from semgrep.error import SemgrepError
-from semgrep.profile_manager import ProfileManager
 from semgrep.error import UnknownLanguageError
+from semgrep.evaluation import create_output
 from semgrep.evaluation import enumerate_patterns_in_boolean_expression
 from semgrep.evaluation import evaluate
+from semgrep.output import OutputSettings
 from semgrep.pattern import Pattern
 from semgrep.pattern_match import PatternMatch
+from semgrep.profile_manager import ProfileManager
+from semgrep.profiling import ProfilingData
+from semgrep.profiling import Times
 from semgrep.rule import Rule
 from semgrep.rule_match import RuleMatch
 from semgrep.semgrep_types import BooleanRuleExpression
 from semgrep.semgrep_types import Language
-from semgrep.semgrep_types import REGEX_ONLY_LANGUAGE_KEYS, GENERIC_LANGUAGE
 from semgrep.semgrep_types import OPERATORS
 from semgrep.semgrep_types import TAINT_MODE
 from semgrep.spacegrep import run_spacegrep
 from semgrep.target_manager import TargetManager
+from semgrep.target_manager_extensions import all_supported_languages
 from semgrep.util import debug_tqdm_write
 from semgrep.util import partition
 from semgrep.util import progress_bar
+from semgrep.util import SEMGREP_PATH
 from semgrep.util import sub_run
+from semgrep.verbose_logging import getLogger
+
+logger = getLogger(__name__)
 
 
 def _offset_to_line_no(offset: int, buff: str) -> int:
@@ -92,39 +96,12 @@ def get_re_matches(
                     "line": _offset_to_line_no(match.end(), contents),
                     "col": _offset_to_col_no(match.end(), contents),
                 },
-                "extra": {"lines": [contents[match.start() : match.end()]]},
+                "extra": {},
             }
         )
         for pattern_id, pattern in patterns_re
         for match in re.finditer(pattern, contents)
     ]
-
-
-def get_target_files(
-    targets: List[Path], exclude: List[str], include: List[str]
-) -> List[Path]:
-    if not include:
-        # Default to all files
-        include = ["*"]
-
-    filepaths = [
-        target
-        for target in targets
-        if target.is_file()
-        and any(target.match(i) for i in include)
-        and not any(target.match(e) for e in exclude)
-    ]
-    filepaths.extend(
-        path
-        for target in targets
-        if target.is_dir()
-        for path in target.rglob("*")
-        if path.is_file()
-        and any(path.match(i) for i in include)
-        and not any(path.match(e) for e in exclude)
-    )
-
-    return filepaths
 
 
 class CoreRunner:
@@ -136,17 +113,21 @@ class CoreRunner:
 
     def __init__(
         self,
+        output_settings: OutputSettings,
         allow_exec: bool,
         jobs: int,
         timeout: int,
         max_memory: int,
         timeout_threshold: int,
+        optimizations: str,
     ):
+        self._output_settings = output_settings
         self._allow_exec = allow_exec
         self._jobs = jobs
         self._timeout = timeout
         self._max_memory = max_memory
         self._timeout_threshold = timeout_threshold
+        self._optimizations = optimizations
 
     def _flatten_rule_patterns(self, rules: List[Rule]) -> Iterator[Pattern]:
         """
@@ -196,46 +177,37 @@ class CoreRunner:
             raise SemgrepError(
                 f'{error_json["language"]} was accepted by semgrep but rejected by semgrep-core. {PLEASE_FILE_ISSUE_TEXT}'
             )
+        elif error_type == "invalid regexp in rule":
+            raise SemgrepError(f'Invalid regexp in rule: {error_json["message"]}')
         elif error_type == "invalid pattern":
-
-            matching_pattern = next(
-                (p for p in patterns if p._id == error_json["pattern_id"]), None
-            )
-            if matching_pattern is None or matching_pattern.span is None:
-                raise SemgrepError(
-                    f"Pattern id from semgrep-core was missing in pattern spans. {PLEASE_FILE_ISSUE_TEXT}"
+            if self._optimizations == "all":
+                raise InvalidPatternErrorNoSpan(
+                    rule_id=error_json.get("pattern_id", "<no rule_id>"),
+                    pattern=error_json.get("pattern", "<no pattern>"),
+                    language=error_json.get("language", "<no language>"),
                 )
-            matching_span = matching_pattern.span
+            else:
+                matching_pattern = next(
+                    (p for p in patterns if p._id == error_json["pattern_id"]), None
+                )
+                if matching_pattern is None or matching_pattern.span is None:
+                    raise SemgrepError(
+                        f"Pattern id from semgrep-core was missing in pattern spans. {PLEASE_FILE_ISSUE_TEXT}"
+                    )
+                matching_span = matching_pattern.span
 
-            raise InvalidPatternError(
-                short_msg=error_type,
-                long_msg=f"Pattern could not be parsed as a {error_json['language']} semgrep pattern",
-                spans=[matching_span],
-                help=None,
-            )
+                raise InvalidPatternError(
+                    short_msg=error_type,
+                    long_msg=f"Pattern could not be parsed as a {error_json['language']} semgrep pattern",
+                    spans=[matching_span],
+                    help=None,
+                )
         # no special formatting ought to be required for the other types; the semgrep python should be performing
         # validation for them. So if any other type of error occurs, ask the user to file an issue
         else:
             raise SemgrepError(
                 f"an internal error occured while invoking semgrep-core while running rule '{rule.id}'. Consider skipping this rule and reporting this issue.\n\t{error_type}: {error_json.get('message', 'no message')}\n{PLEASE_FILE_ISSUE_TEXT}"
             )
-
-    def _flatten_all_equivalences(self, rules: List[Rule]) -> List[Equivalence]:
-        """
-        Convert all the equivalences defined in the rules into a single rule file
-        """
-
-        equivalences = []
-
-        for rule in rules:
-            try:
-                equivalences.extend(rule.equivalences)
-            except Exception as e:
-                raise SemgrepError(
-                    f"could not get equivalences for rule {rule.id}: {e}"
-                )
-
-        return equivalences
 
     def _write_equivalences_file(self, fp: IO, equivalences: List[Equivalence]) -> None:
         # I don't even know why this is a thing.
@@ -270,7 +242,7 @@ class CoreRunner:
 
             cmd = [SEMGREP_PATH] + [
                 "-lang",
-                language,
+                language.value,
                 "-json",
                 rules_file_flag,
                 pattern_file.name,
@@ -284,6 +256,7 @@ class CoreRunner:
                 str(self._timeout),
                 "-max_memory",
                 str(self._max_memory),
+                "-json_time",
             ]
 
             equivalences = rule.equivalences
@@ -291,31 +264,127 @@ class CoreRunner:
                 self._write_equivalences_file(equiv_file, equivalences)
                 cmd += ["-equivalences", equiv_file.name]
 
+            if self._output_settings.debug:
+                cmd += ["-debug"]
+
             core_run = sub_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            logger.debug(core_run.stderr.decode("utf-8", errors="replace"))
-
-            if core_run.returncode != 0:
-                output_json = self._parse_core_output(core_run.stdout)
-
-                if "error" in output_json:
-                    self._raise_semgrep_error_from_json(output_json, patterns, rule)
-                else:
-                    raise SemgrepError(
-                        f"unexpected json output while invoking semgrep-core with rule '{rule.id}':\n{PLEASE_FILE_ISSUE_TEXT}"
-                    )
-
-            output_json = self._parse_core_output(core_run.stdout)
-
+            output_json = self._extract_core_output(rule, patterns, core_run)
             return output_json
 
-    def _parse_core_output(self, core_run_out: bytes) -> Dict[str, Any]:
-        # see if semgrep output a JSON error that we can decode
-        semgrep_output = core_run_out.decode("utf-8", errors="replace")
+    def _extract_core_output(
+        self, rule: Rule, patterns: List[Pattern], core_run: subprocess.CompletedProcess
+    ) -> Dict[str, Any]:
+        semgrep_output = core_run.stdout.decode("utf-8", errors="replace")
+        semgrep_error_output = core_run.stderr.decode("utf-8", errors="replace")
+
+        # By default, we print semgrep-core's error output, which includes
+        # semgrep-core's logging if it was requested via --debug.
+        #
+        # If semgrep-core prints anything on stderr when running with default
+        # flags, it's a bug that should be fixed in semgrep-core.
+        #
+        if semgrep_error_output != "":
+            name = f"[rule '{rule.id}']"
+            logger.info(
+                f"--- semgrep-core stderr {name} ---\n"
+                f"{semgrep_error_output}"
+                f"--- end semgrep-core stderr {name} ---"
+            )
+
+        returncode = core_run.returncode
+        if returncode != 0:
+            output_json = self._parse_core_output(
+                rule, core_run, semgrep_output, semgrep_error_output, returncode
+            )
+
+            if "error" in output_json:
+                self._raise_semgrep_error_from_json(output_json, patterns, rule)
+            else:
+                self._fail(
+                    'non-zero exit status with missing "error" field in json response',
+                    rule,
+                    core_run,
+                    returncode,
+                    semgrep_output,
+                    semgrep_error_output,
+                )
+
+        output_json = self._parse_core_output(
+            rule, core_run, semgrep_output, semgrep_error_output, returncode
+        )
+        return output_json
+
+    def _parse_core_output(
+        self,
+        rule: Rule,
+        core_run: subprocess.CompletedProcess,
+        semgrep_output: str,
+        semgrep_error_output: str,
+        returncode: int,
+    ) -> Dict[str, Any]:
+        # See if semgrep output contains a JSON error that we can decode.
         try:
             return cast(Dict[str, Any], json.loads(semgrep_output))
         except ValueError:
-            raise SemgrepError(
-                f"unexpected non-json output while invoking semgrep-core:\n{semgrep_output}\n\n{PLEASE_FILE_ISSUE_TEXT}"
+            self._fail(
+                "unparseable json output",
+                rule,
+                core_run,
+                returncode,
+                semgrep_output,
+                semgrep_error_output,
+            )
+            return {}  # never reached
+
+    def _fail(
+        self,
+        reason: str,
+        rule: Rule,
+        core_run: subprocess.CompletedProcess,
+        returncode: int,
+        semgrep_output: str,
+        semgrep_error_output: str,
+    ) -> None:
+        # Once we require python >= 3.8, switch to using shlex.join instead
+        # for proper quoting of the command line.
+        shell_command = " ".join(core_run.args)
+        raise SemgrepError(
+            f"semgrep-core failed: {reason}\n"
+            f"rule ID: '{rule.id}'\n"
+            f"semgrep-core exit code: {returncode}\n"
+            f"semgrep-core command: {shell_command}\n"
+            f"unexpected non-json output while invoking semgrep-core:\n"
+            "--- semgrep-core stdout ---\n"
+            f"{semgrep_output}"
+            "--- end semgrep-core stdout ---\n"
+            "--- semgrep-core stderr ---\n"
+            f"{semgrep_error_output}"
+            "--- end semgrep-core stderr ---\n"
+            f"{PLEASE_FILE_ISSUE_TEXT}"
+        )
+
+    def _add_match_times(
+        self,
+        rule: Rule,
+        profiling_data: ProfilingData,
+        output_time_json: Dict[str, Any],
+    ) -> None:
+        """Collect the match times reported by semgrep-core (or spacegrep)."""
+        if "targets" in output_time_json:
+            for target in output_time_json["targets"]:
+                if "match_time" in target and "path" in target:
+                    profiling_data.set_run_times(
+                        rule,
+                        Path(target["path"]),
+                        Times(
+                            parse_time=target["parse_time"],
+                            match_time=target["match_time"],
+                            run_time=target["run_time"],
+                        ),
+                    )
+        if "rule_parse_time" in output_time_json:
+            profiling_data.set_rule_parse_time(
+                rule, output_time_json["rule_parse_time"]
             )
 
     def _run_rule(
@@ -325,6 +394,7 @@ class CoreRunner:
         cache_dir: str,
         max_timeout_files: List[Path],
         profiler: ProfileManager,
+        profiling_data: ProfilingData,
     ) -> Tuple[List[RuleMatch], List[Dict[str, Any]], List[SemgrepError], Set[Path]]:
         """
         Run all rules on targets and return list of all places that match patterns, ... todo errors
@@ -376,8 +446,19 @@ class CoreRunner:
 
                 # regex-only rules only support OPERATORS.REGEX.
                 # Skip passing this rule to semgrep-core.
-                if language in REGEX_ONLY_LANGUAGE_KEYS:
+                if language == Language.REGEX:
                     continue
+
+                # metatavarible-pattern is only available via --optimizations
+                metavariable_patterns = [
+                    pattern
+                    for pattern in patterns
+                    if pattern.expression.operator == OPERATORS.METAVARIABLE_PATTERN
+                ]
+                if len(metavariable_patterns) > 0:
+                    raise SemgrepError(
+                        "Operator metavariable-pattern is only supported by semgrep-core"
+                    )
 
                 # semgrep-core doesn't know about the following operators -
                 # they are strictly semgrep Python features:
@@ -395,7 +476,7 @@ class CoreRunner:
 
                 patterns_json = [p.to_json() for p in patterns]
 
-                if language == GENERIC_LANGUAGE:
+                if language == Language.GENERIC:
                     output_json = profiler.track(
                         rule.id,
                         run_spacegrep,
@@ -418,10 +499,12 @@ class CoreRunner:
                     )
 
             errors.extend(
-                CoreException.from_json(e, language, rule.id).into_semgrep_error()
+                CoreException.from_json(e, language.value, rule.id).into_semgrep_error()
                 for e in output_json["errors"]
             )
             outputs.extend(PatternMatch(m) for m in output_json["matches"])
+            if "time" in output_json:
+                self._add_match_times(rule, profiling_data, output_json["time"])
 
         # group output; we want to see all of the same rule ids on the same file path
         by_rule_index: Dict[
@@ -493,7 +576,8 @@ class CoreRunner:
         Dict[Rule, List[RuleMatch]],
         Dict[Rule, List[Dict[str, Any]]],
         List[SemgrepError],
-        Set[Path],
+        Set[Path],  # targets
+        ProfilingData,  # match time for each (rule, target)
     ]:
         findings_by_rule: Dict[Rule, List[RuleMatch]] = {}
         debugging_steps_by_rule: Dict[Rule, List[Dict[str, Any]]] = {}
@@ -501,19 +585,21 @@ class CoreRunner:
         file_timeouts: Dict[Path, int] = collections.defaultdict(lambda: 0)
         max_timeout_files: List[Path] = []
         all_targets: Set[Path] = set()
+        profiling_data: ProfilingData = ProfilingData()
 
         # cf. for bar_format: https://tqdm.github.io/docs/tqdm/
         with tempfile.TemporaryDirectory() as semgrep_core_ast_cache_dir:
             for rule in progress_bar(
                 rules, bar_format="{l_bar}{bar}|{n_fmt}/{total_fmt}"
             ):
-                debug_tqdm_write(f"Running rule {rule._raw.get('id')}...")
+                debug_tqdm_write(f"Running rule {rule.id}...")
                 rule_matches, debugging_steps, errors, rule_targets = self._run_rule(
                     rule,
                     target_manager,
                     semgrep_core_ast_cache_dir,
                     max_timeout_files,
                     profiler,
+                    profiling_data,
                 )
                 all_targets = all_targets.union(rule_targets)
                 findings_by_rule[rule] = rule_matches
@@ -529,28 +615,167 @@ class CoreRunner:
                             max_timeout_files.append(err.path)
 
         all_errors = dedup_errors(all_errors)
-        return findings_by_rule, debugging_steps_by_rule, all_errors, all_targets
+        return (
+            findings_by_rule,
+            debugging_steps_by_rule,
+            all_errors,
+            all_targets,
+            profiling_data,
+        )
+
+    def _run_rules_direct_to_semgrep_core(
+        self,
+        rules: List[Rule],
+        target_manager: TargetManager,
+        profiler: ProfileManager,
+    ) -> Tuple[
+        Dict[Rule, List[RuleMatch]],
+        Dict[Rule, List[Any]],
+        List[SemgrepError],
+        Set[Path],
+        ProfilingData,
+    ]:
+        logger.debug(f"Passing whole rules directly to semgrep_core")
+
+        outputs: Dict[Rule, List[RuleMatch]] = collections.defaultdict(list)
+        errors: List[SemgrepError] = []
+        all_targets: Set[Path] = set()
+        file_timeouts: Dict[Path, int] = collections.defaultdict(lambda: 0)
+        max_timeout_files: Set[Path] = set()
+
+        profiling_data: ProfilingData = ProfilingData()
+        # cf. for bar_format: https://tqdm.github.io/docs/tqdm/
+        with tempfile.TemporaryDirectory() as semgrep_core_ast_cache_dir:
+            for rule in progress_bar(
+                rules, bar_format="{l_bar}{bar}|{n_fmt}/{total_fmt}"
+            ):
+                for language in rule.languages:
+                    debug_tqdm_write(f"Running rule {rule.id}...")
+                    with tempfile.NamedTemporaryFile(
+                        "w", suffix=".yaml"
+                    ) as rule_file, tempfile.NamedTemporaryFile(
+                        "w"
+                    ) as target_file, tempfile.NamedTemporaryFile(
+                        "w"
+                    ) as equiv_file:
+                        targets = self.get_files_for_language(
+                            language, rule, target_manager
+                        )
+
+                        targets = [
+                            target
+                            for target in targets
+                            if target not in max_timeout_files
+                        ]
+
+                        # opti: no need to call semgrep-core if no target files
+                        if not targets:
+                            continue
+                        all_targets = all_targets.union(targets)
+
+                        target_file.write("\n".join(map(lambda p: str(p), targets)))
+                        target_file.flush()
+                        yaml = YAML()
+                        yaml.dump({"rules": [rule._raw]}, rule_file)
+                        rule_file.flush()
+
+                        cmd = [SEMGREP_PATH] + [
+                            "-lang",
+                            language.value,
+                            "-fast",
+                            "-json",
+                            "-config",
+                            rule_file.name,
+                            "-j",
+                            str(self._jobs),
+                            "-target_file",
+                            target_file.name,
+                            "-use_parsing_cache",
+                            semgrep_core_ast_cache_dir,
+                            "-timeout",
+                            str(self._timeout),
+                            "-max_memory",
+                            str(self._max_memory),
+                            "-json_time",
+                        ]
+
+                        equivalences = rule.equivalences
+                        if equivalences:
+                            self._write_equivalences_file(equiv_file, equivalences)
+                            cmd += ["-equivalences", equiv_file.name]
+
+                        if self._output_settings.debug:
+                            cmd += ["-debug"]
+
+                        core_run = sub_run(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
+                        output_json = self._extract_core_output(rule, [], core_run)
+
+                        if "time" in output_json:
+                            self._add_match_times(
+                                rule, profiling_data, output_json["time"]
+                            )
+
+                    # end with tempfile.NamedTemporaryFile(...) ...
+                    pattern_matches = [
+                        PatternMatch(match) for match in output_json["matches"]
+                    ]
+                    findings = create_output(rule, pattern_matches)
+
+                    # TODO: we should do that in Semgrep_generic.ml instead
+                    findings = dedup_output(findings)
+                    outputs[rule].extend(findings)
+                    parsed_errors = [
+                        CoreException.from_json(
+                            e, language.value, rule.id
+                        ).into_semgrep_error()
+                        for e in output_json["errors"]
+                    ]
+                    for err in parsed_errors:
+                        if isinstance(err, MatchTimeoutError):
+                            file_timeouts[err.path] += 1
+                            if (
+                                self._timeout_threshold != 0
+                                and file_timeouts[err.path] >= self._timeout_threshold
+                            ):
+                                max_timeout_files.add(err.path)
+                    errors.extend(parsed_errors)
+            # end for language ...
+        # end for rule ...
+
+        return outputs, {}, errors, all_targets, profiling_data
+
+    # end _run_rules_direct_to_semgrep_core
 
     def invoke_semgrep(
         self,
         target_manager: TargetManager,
+        profiler: ProfileManager,
         rules: List[Rule],
     ) -> Tuple[
         Dict[Rule, List[RuleMatch]],
         Dict[Rule, List[Dict[str, Any]]],
         List[SemgrepError],
         Set[Path],
-        ProfileManager,
+        ProfilingData,
     ]:
         """
         Takes in rules and targets and retuns object with findings
         """
         start = datetime.now()
-        profiler = ProfileManager()
 
-        findings_by_rule, debug_steps_by_rule, errors, all_targets = self._run_rules(
-            rules, target_manager, profiler
+        experimental = self._optimizations != "none"
+        runner_fxn = (
+            self._run_rules_direct_to_semgrep_core if experimental else self._run_rules
         )
+        (
+            findings_by_rule,
+            debug_steps_by_rule,
+            errors,
+            all_targets,
+            profiling_data,
+        ) = runner_fxn(rules, target_manager, profiler)
 
         logger.debug(
             f"semgrep ran in {datetime.now() - start} on {len(all_targets)} files"
@@ -564,11 +789,26 @@ class CoreRunner:
         ]
         logger.debug(f'findings summary: {", ".join(by_sev_strings)}')
 
-        return findings_by_rule, debug_steps_by_rule, errors, all_targets, profiler
+        return (
+            findings_by_rule,
+            debug_steps_by_rule,
+            errors,
+            all_targets,
+            profiling_data,
+        )
 
 
+# This will remove matches that have the same range but different
+# metavariable bindings, choosing the last one in the list. We want the
+# last because if there multiple possible bindings, they will be returned
+# by semgrep-core from largest range to smallest. For an example, see
+# tests/e2e/test_message_interpolation.py::test_message_interpolation;
+# specifically, the multi-pattern-inside test
+#
+# Another option is to not dedup, since Semgrep.ml now does its own deduping
+# otherwise, and surface both matches
 def dedup_output(outputs: List[RuleMatch]) -> List[RuleMatch]:
-    return list({uniq_id(r): r for r in outputs}.values())
+    return list({uniq_id(r): r for r in reversed(outputs)}.values())[::-1]
 
 
 def dedup_errors(errors: List[SemgrepError]) -> List[SemgrepError]:

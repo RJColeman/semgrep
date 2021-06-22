@@ -6,7 +6,6 @@
 import argparse
 import os
 import subprocess
-import sys
 import time
 import urllib.request
 from typing import List
@@ -15,7 +14,7 @@ HOST = "https://dashboard.semgrep.dev"
 
 
 class Test:
-    def __init__(self, name: str, lang: str, target: str):
+    def __init__(self, name: str, lang: str, target: str, is_config: bool = False):
         # Test name. Pattern file name is NAME.sgrep.
         self.name = name
 
@@ -25,10 +24,14 @@ class Test:
         # Target file name
         self.target = target
 
+        # Whether the file is a config
+        self.is_config = is_config
+
 
 TESTS = [
     # Control. No other test can be faster than this one.
     Test("empty", "js", "empty.js"),
+    #
     # Match on a simple statement, no ellipsis. Serves as the baseline
     # for the other tests on the same file.
     Test("stmts-simple", "js", "l10000.js"),
@@ -47,6 +50,21 @@ TESTS = [
     Test("stmts-double-ellipsis-aba", "js", "l1000.js"),
     # Double ellipsis on statements with backrefs: $A; ... $A; ... foo($A);
     Test("stmts-double-ellipsis-aaa", "js", "l1000.js"),
+    #
+    # Real world examples (.sgrep or .yaml files when True last argument)
+    #
+    # Metavariable as a key in a class definition with ellipsis
+    Test("anyorder-metavar-key", "java", "l5000.java"),
+    # Two pattern-not-insides with ellipsis
+    Test("stmts-ellipsis-inside", "js", "l1000.js", True),
+    # Multiple pattern-nots with multiple pattern-eithrs
+    Test("metavariable-regexp-dict", "generic", "l5000.json", True),
+    Test("metavariable-regexp-dict2", "json", "l5000.json", True),
+    #
+    # TODO, not yet optimized
+    #
+    # Multiple pattern-nots with multiple pattern-eithrs
+    Test("range-stmts", "python", "l300.py", True),
 ]
 
 
@@ -61,7 +79,13 @@ def run_tests(
 ) -> List[Result]:
     results = []
     for test in tests:
-        pattern_file = os.path.join(dirname, test.name + ".sgrep")
+        ext = ".sgrep"
+        flag = "-f"
+        if test.is_config:
+            ext = ".yaml"
+            flag = "-config"
+
+        pattern_file = os.path.join(dirname, test.name + ext)
         target_file = os.path.join(dirname, test.target)
 
         t1 = time.time()
@@ -69,7 +93,7 @@ def run_tests(
             "semgrep-core",
             "-lang",
             test.lang,
-            "-f",
+            flag,
             pattern_file,
             target_file,
         ]

@@ -15,20 +15,27 @@ TREESITTER_LIBDIR ?= $(shell pkg-config --libs-only-L tree-sitter \
 export TREESITTER_LIBDIR
 
 all:
-	./scripts/make-version > ./CLI/version.ml
+	rm -f bin
+	./scripts/make-version > ./src/cli/version.ml
 	dune build
 	dune build ./_build/default/tests/test.bc
+	# make executables easily accessible for manual testing:
+	test -e bin || ln -s _build/install/default/bin .
 clean:
 	dune clean
+	rm -f bin
 # I put all as a dependency because sometimes you modify a test file
 # and dune runtest -f does not see this new file, probably because
 # the cached file under _build/.../tests/ is still the old one.
 test: all
+	$(MAKE) -C src/spacegrep test
 	dune runtest -f
 e2etest:
 	python3 tests/e2e/test_target_file.py
 install:
 	dune install
+	cp -f _build/install/default/bin/semgrep-core ../semgrep/semgrep/bin/
+	cp -f _build/install/default/bin/spacegrep ../semgrep/semgrep/bin/
 dump:
 	./_build/default/tests/test.bc -dump_ast tests/lint/stupid.py
 
@@ -38,7 +45,7 @@ dump:
 
 pr:
 	git push origin `git rev-parse --abbrev-ref HEAD`
-	hub pull-request -b develop -r mjambon
+	hub pull-request -b develop -r mjambon -r IagoAbal -r emjin
 
 push:
 	git push origin `git rev-parse --abbrev-ref HEAD`
@@ -59,6 +66,8 @@ index:
 
 visual:
 	codemap -screen_size 3 -filter pfff -efuns_client efuns_client -emacs_client /dev/null .
+visual2:
+	codemap -screen_size 3 -filter pfff -efuns_client efuns_client -emacs_client /dev/null src
 
 .PHONY: check index visual
 
